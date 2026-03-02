@@ -8,6 +8,11 @@ Wants=tailscale-install.timer
 Type=oneshot
 Environment=DEBIAN_FRONTEND=noninteractive
 ExecStart=/bin/bash -c "/data/tailscale/manage.sh on-boot"
+# Retry every 5 minutes on failure, up to 24 hours
+Restart=on-failure
+RestartSec=5m
+StartLimitIntervalSec=24h
+StartLimitBurst=288
 
 [Install]
 WantedBy=multi-user.target

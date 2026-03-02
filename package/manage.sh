@@ -59,8 +59,14 @@ tailscale_install() {
   echo "Updating package lists..."
   apt update
 
-  echo "Installing Tailscale ${tailscale_version}..."
-  apt install -y tailscale="${tailscale_version}"
+  # Install Tailscale with version pinning if available, otherwise install latest from repo
+  if [ -n "$tailscale_version" ] && [ "$tailscale_version" != "null" ]; then
+    echo "Installing Tailscale ${tailscale_version}..."
+    apt install -y tailscale="${tailscale_version}"
+  else
+    echo "Installing latest Tailscale from repository (version unavailable)..."
+    apt install -y tailscale
+  fi
 
   echo "Configuring Tailscale port..."
   sed -i "s/PORT=\"[^\"]*\"/PORT=\"${PORT:-41641}\"/" /etc/default/tailscaled || {
@@ -125,7 +131,7 @@ tailscale_uninstall() {
 
   systemctl disable tailscale-install.timer || true
   rm -f /lib/systemd/system/tailscale-install.timer || true
-  
+
   systemctl disable tailscale-cert-renewal.timer || true
   systemctl stop tailscale-cert-renewal.timer || true
   rm -f /lib/systemd/system/tailscale-cert-renewal.service || true
@@ -135,6 +141,13 @@ tailscale_uninstall() {
 tailscale_has_update() {
   CURRENT_VERSION="$(tailscale --version | head -n 1)"
   TARGET_VERSION="${1:-$(curl --ipv4 -sSLq 'https://pkgs.tailscale.com/stable/?mode=json' | jq -r '.Tarballs.arm64 | capture("tailscale_(?<version>[^_]+)_").version')}"
+
+  # Validate TARGET_VERSION is not empty or null
+  if [ -z "$TARGET_VERSION" ] || [ "$TARGET_VERSION" = "null" ]; then
+    echo "Unable to determine target version (network may be unavailable)"
+    return 1
+  fi
+
   if [ "${CURRENT_VERSION}" != "${TARGET_VERSION}" ]; then
     return 0
   else
@@ -143,9 +156,18 @@ tailscale_has_update() {
 }
 
 tailscale_update() {
-  tailscale_stop
-  tailscale_install "$1"
-  tailscale_start
+  # Don't stop Tailscale before update - apt can handle the upgrade while running
+  # This prevents service disruption if the install fails
+
+  tailscale_install "$1" || {
+    echo "Update failed, ensuring Tailscale is running..."
+    # If install failed, make sure Tailscale is at least started
+    tailscale_start || true
+    return 1
+  }
+
+  # Restart to pick up the new version
+  systemctl restart tailscaled
 }
 
 tailscale_cert_generate() {
@@ -153,7 +175,7 @@ tailscale_cert_generate() {
 
   mkdir -p "$cert_dir"
   echo "Generating certificate for $TAILSCALE_HOSTNAME..."
-  
+
   if tailscale cert --cert-file "$cert_dir/$TAILSCALE_HOSTNAME.crt" --key-file "$cert_dir/$TAILSCALE_HOSTNAME.key" "$TAILSCALE_HOSTNAME"; then
       chmod 644 "$cert_dir/$TAILSCALE_HOSTNAME.crt"
       chmod 600 "$cert_dir/$TAILSCALE_HOSTNAME.key"
@@ -162,7 +184,7 @@ tailscale_cert_generate() {
       echo "  Private key: $cert_dir/$TAILSCALE_HOSTNAME.key"
       echo ""
       echo "Certificate expires in 90 days. Use '$0 cert renew $TAILSCALE_HOSTNAME' to renew."
-      
+
       # Install auto-renewal timer if not already installed
       if [ ! -L "/etc/systemd/system/tailscale-cert-renewal.service" ]; then
           if [ -f "${TAILSCALE_ROOT}/tailscale-cert-renewal.service" ] && [ -f "${TAILSCALE_ROOT}/tailscale-cert-renewal.timer" ]; then
@@ -194,7 +216,7 @@ tailscale_cert_renew() {
   fi
 
   echo "Renewing certificate for $TAILSCALE_HOSTNAME..."
-  
+
   # Backup existing certificates
   cp "$cert_dir/$TAILSCALE_HOSTNAME.crt" "$cert_dir/$TAILSCALE_HOSTNAME.crt.bak"
   cp "$cert_dir/$TAILSCALE_HOSTNAME.key" "$cert_dir/$TAILSCALE_HOSTNAME.key.bak"
@@ -243,16 +265,16 @@ tailscale_cert_install_unifi() {
       echo "Use '$0 cert generate' to create a certificate first"
       exit 1
   fi
-  
+
   echo "Installing certificate for UniFi controller..."
-  
+
   # Install for UniFi OS (nginx)
   if [ -d "/data/unifi-core/config" ]; then
       echo "Installing certificate for UniFi OS web interface..."
-      
+
       # Generate a UUID for the certificate
       cert_uuid=$(cat /proc/sys/kernel/random/uuid)
-      
+
       # Copy certificates with UUID names
       cp "$cert_dir/$TAILSCALE_HOSTNAME.crt" "/data/unifi-core/config/$cert_uuid.crt"
       cp "$cert_dir/$TAILSCALE_HOSTNAME.key" "/data/unifi-core/config/$cert_uuid.key"
@@ -260,7 +282,7 @@ tailscale_cert_install_unifi() {
       # Set proper permissions
       chmod 644 "/data/unifi-core/config/$cert_uuid.crt"
       chmod 600 "/data/unifi-core/config/$cert_uuid.key"
-      
+
       # Register certificate in PostgreSQL database for persistence
       if [ -f "${TAILSCALE_ROOT}/helpers/cert-db-register.sh" ]; then
           echo "Registering certificate in database..."
@@ -268,13 +290,13 @@ tailscale_cert_install_unifi() {
       else
           echo "Warning: Database registration script not found. Certificate may not persist across restarts."
       fi
-      
+
       # Update nginx configuration
       cat > /data/unifi-core/config/http/local-certs.conf <<EOF
 ssl_certificate     /data/unifi-core/config/$cert_uuid.crt;
 ssl_certificate_key /data/unifi-core/config/$cert_uuid.key;
 EOF
-      
+
       # Update settings.yaml to activate the certificate
       if grep -q "activeCertId:" /data/unifi-core/config/settings.yaml 2>/dev/null; then
           # Update existing activeCertId
@@ -283,7 +305,7 @@ EOF
           # Add activeCertId if it doesn't exist
           echo "activeCertId: $cert_uuid" >> /data/unifi-core/config/settings.yaml
       fi
-      
+
       echo "UniFi OS certificate installed with ID: $cert_uuid"
       echo "Note: Restart unifi-core for the certificate to take effect:"
       echo "  systemctl restart unifi-core"
@@ -293,14 +315,14 @@ EOF
 tailscale_cert() {
     action="${1:-help}"
     cert_dir="${TAILSCALE_ROOT}/certs"
-    
+
     # Derive hostname from tailscale status (except for help and list commands)
     if [ "$action" != "help" ] && [ "$action" != "list" ]; then
         if ! systemctl is-active --quiet tailscaled; then
             echo "Tailscale is not running. Please start Tailscale first."
             exit 1
         fi
-        
+
         TAILSCALE_HOSTNAME="$(tailscale status --json | jq -r '.Self.DNSName[:-1]')"
         if [ -z "$TAILSCALE_HOSTNAME" ]; then
             echo "Failed to determine Tailscale hostname"
@@ -309,24 +331,24 @@ tailscale_cert() {
 
         export TAILSCALE_HOSTNAME
     fi
-    
+
     case "$action" in
         generate)
             tailscale_cert_generate
             ;;
-            
+
         renew)
             tailscale_cert_renew
             ;;
-            
+
         info)
             tailscale_cert_info
             ;;
-            
+
         install-unifi)
             tailscale_cert_install_unifi
             ;;
-            
+
         help|*)
             echo "Usage: $0 cert {generate|renew|info|install-unifi}"
             echo ""
@@ -406,7 +428,7 @@ case $1 in
     fi
 
     if [ "${TAILSCALE_AUTOUPDATE}" = "true" ]; then
-      tailscale_has_update && tailscale_update || echo "Not updated"
+      tailscale_has_update && tailscale_update || echo "No update available or unable to check"
     fi
 
     tailscale_start
